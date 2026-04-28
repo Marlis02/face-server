@@ -283,7 +283,6 @@ def stats_group(
             result.append(UserAttendanceStat(
                 user_id=user.id,
                 full_name=user.full_name,
-                employee_id=user.employee_id,
                 total_days=total_days,
                 present_days=present_days,
                 absent_days=absent_days,
@@ -456,7 +455,6 @@ def stats_group_detail_today(
             result.append(UserDailyDetail(
                 user_id=user.id,
                 full_name=user.full_name,
-                employee_id=user.employee_id,
                 status="present" if att else "absent",
                 marked_at=att.marked_at if att else None,
                 device_id=att.device_id if att else None,

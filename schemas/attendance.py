@@ -25,11 +25,10 @@ class AttendanceResponse(BaseModel):
 class UserAttendanceStat(BaseModel):
     user_id: int
     full_name: str
-    employee_id: str
-    total_days: int       
-    present_days: int     
-    absent_days: int      
-    percent: float         
+    total_days: int
+    present_days: int
+    absent_days: int
+    percent: float
 
 
 class GroupAttendanceStat(BaseModel):
@@ -53,7 +52,6 @@ class DailyAttendance(BaseModel):
 class UserDailyDetail(BaseModel):
     user_id: int
     full_name: str
-    employee_id: str
     status: str            # present / absent
     marked_at: Optional[datetime]
     device_id: Optional[int]
