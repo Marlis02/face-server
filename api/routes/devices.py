@@ -271,3 +271,38 @@ def device_init(
         )
     finally:
         tenant_db.close()
+        
+@router.post("/{tenant_slug}/devices/{device_id}/reset-password")
+def reset_device_password(
+    tenant_slug: str,
+    device_id: int,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Сбросить пароль устройства. Только admin."""
+
+    tenant_db: Session = next(get_tenant_db(current_user["db_name"]))
+
+    try:
+        device = tenant_db.query(Device).filter(
+            Device.id == device_id
+        ).first()
+
+        if not device:
+            raise HTTPException(status_code=404, detail="Устройство не найдено")
+
+        # генерируем новый пароль
+        import secrets
+        new_password = secrets.token_urlsafe(8)
+
+        device.password_hash = hash_password(new_password)
+        # сбрасываем токен — устройство должно перелогиниться
+        device.token = None
+        tenant_db.commit()
+
+        return {
+            "message": f"Пароль устройства '{device.name}' сброшен",
+            "login": device.login,
+            "new_password": new_password,
+        }
+    finally:
+        tenant_db.close()

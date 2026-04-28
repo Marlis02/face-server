@@ -4,7 +4,7 @@ from core.master_db import get_master_db
 from core.tenant_db import get_tenant_db
 from models.master import Tenant
 from models.tenant import Device, User, Attendance
-from services.face_service import face_service
+from services.face_service import face_service, executor
 from datetime import datetime, timezone, date
 import struct
 import json
@@ -110,15 +110,22 @@ async def process_frame(
 ) -> None:
     """
     Обрабатывает один кадр с лицом.
-    Извлекает эмбеддинг, ищет совпадение, записывает посещение.
+    Тяжёлые операции (InsightFace) запускаются в отдельном потоке
+    чтобы не блокировать event loop для других планшетов.
     """
 
     # читаем tracking_id и jpeg
     tracking_id = struct.unpack(">i", data[:4])[0]
     jpeg_bytes = data[4:]
 
-    # декодируем JPEG → numpy array
-    image = face_service.decode_jpeg(jpeg_bytes)
+    loop = asyncio.get_event_loop()
+
+    # декодируем JPEG в отдельном потоке — не блокирует event loop
+    image = await loop.run_in_executor(
+        executor,
+        face_service.decode_jpeg,
+        jpeg_bytes,
+    )
     if image is None:
         await websocket.send_text(json.dumps({
             "type": "result",
@@ -128,8 +135,12 @@ async def process_frame(
         }))
         return
 
-    # извлекаем эмбеддинг
-    embedding = face_service.get_embedding(image)
+    # InsightFace в отдельном потоке — не блокирует event loop
+    embedding = await loop.run_in_executor(
+        executor,
+        face_service.get_embedding,
+        image,
+    )
     if embedding is None:
         await websocket.send_text(json.dumps({
             "type": "result",
@@ -142,7 +153,8 @@ async def process_frame(
     # ищем совпадение в базе
     tenant_db: Session = next(get_tenant_db(tenant.db_name))
     try:
-        match = face_service.find_match(embedding, tenant_db)
+        # способы 1+2 — кэш и батч сравнение
+        match = face_service.find_match(embedding, tenant.db_name, tenant_db)
 
         if not match:
             await websocket.send_text(json.dumps({

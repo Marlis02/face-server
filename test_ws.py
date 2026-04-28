@@ -2,31 +2,37 @@ import asyncio
 import websockets
 import struct
 import json
+import time
 
 async def test():
     uri = "ws://localhost:8000/api/manas/ws"
 
     async with websockets.connect(uri) as ws:
-        # шаг 1 — отправляем токен первым сообщением
         await ws.send(json.dumps({
             "token": "s1-6-cayFQfz-jKktTAbmUuen6Osv_1bxu4RrqgTOaU"
         }))
 
-        # шаг 2 — получаем подтверждение подключения
         response = await ws.recv()
-        print("Подключение:", response)
+        data = json.loads(response)
+        print("Подключение:", json.dumps(data, ensure_ascii=False, indent=2))
 
-        # шаг 3 — отправляем фото
-        with open("test_face.jpg", "rb") as f:
+        with open("/home/marlis/Documents/KSTU/diplom/attendance-backend/z-test/4.jpeg", "rb") as f:
             jpeg_bytes = f.read()
 
-        tracking_id = 1
-        packet = struct.pack(">i", tracking_id) + jpeg_bytes
-        await ws.send(packet)
-        print(f"Отправлено: {len(packet)} байт")
+        # отправляем 3 раза — смотрим как меняется скорость
+        for i in range(1, 4):
+            tracking_id = i
+            packet = struct.pack(">i", tracking_id) + jpeg_bytes
 
-        # шаг 4 — получаем результат
-        result = await ws.recv()
-        print("Результат:", result)
+            start = time.perf_counter()
+            await ws.send(packet)
+
+            result = await ws.recv()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+
+            data = json.loads(result)
+            print(f"\nЗапрос {i}:")
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            print(f"Время: {elapsed_ms:.1f} мс")
 
 asyncio.run(test())

@@ -3,6 +3,7 @@ import numpy as np
 from insightface.app import FaceAnalysis
 from sqlalchemy.orm import Session
 from models.tenant import FaceEmbedding
+from concurrent.futures import ThreadPoolExecutor
 import pickle
 
 # порог сходства — если выше то совпадение
@@ -11,11 +12,18 @@ SIMILARITY_THRESHOLD = 0.5
 # максимум эмбеддингов на пользователя
 MAX_EMBEDDINGS_PER_USER = 5
 
+# пул потоков для тяжёлых операций (InsightFace)
+# не блокирует event loop при обработке нескольких планшетов
+executor = ThreadPoolExecutor(max_workers=2)
+
 
 class FaceService:
     def __init__(self):
         self._app = None
         self._initialized = False
+        # кэш: db_name → (матрица эмбеддингов, список user_id)
+        # не ходим в базу на каждый кадр
+        self._cache: dict[str, tuple] = {}
 
     def initialize(self):
         """
@@ -74,40 +82,74 @@ class FaceService:
         # поэтому просто скалярное произведение
         return float(np.dot(a, b))
 
+    # ─── Кэш эмбеддингов ──────────────────────────────────────
+
+    def load_cache(self, db_name: str, db: Session):
+        """
+        Загружает все эмбеддинги из базы в память.
+        Строит numpy матрицу для быстрого батч-сравнения.
+        Вызывается автоматически при первом запросе.
+        """
+        rows = db.query(FaceEmbedding).all()
+
+        if not rows:
+            self._cache[db_name] = (None, [])
+            return
+
+        vectors = []
+        user_ids = []
+
+        for row in rows:
+            vectors.append(self.bytes_to_embedding(row.embedding))
+            user_ids.append(row.user_id)
+
+        # матрица (N, 512) — все эмбеддинги сразу
+        matrix = np.array(vectors, dtype=np.float32)
+        self._cache[db_name] = (matrix, user_ids)
+
+        print(f"✅ Кэш загружен: {len(user_ids)} эмбеддингов для {db_name}")
+
+    def invalidate_cache(self, db_name: str):
+        """
+        Сбрасывает кэш.
+        Вызывать когда добавили или удалили фото пользователя.
+        """
+        if db_name in self._cache:
+            del self._cache[db_name]
+            print(f"🔄 Кэш сброшен для {db_name}")
+
     def find_match(
         self,
         camera_embedding: np.ndarray,
+        db_name: str,
         db: Session,
     ) -> dict | None:
         """
-        Ищет совпадение среди всех эмбеддингов в базе.
+        Ищет совпадение через кэш + numpy батч.
+        Не делает запрос в базу если кэш уже загружен.
         Возвращает {user_id, score} или None.
         """
 
-        # загружаем все эмбеддинги из базы
-        all_embeddings = db.query(FaceEmbedding).all()
+        # загружаем кэш если нет
+        if db_name not in self._cache:
+            self.load_cache(db_name, db)
 
-        if not all_embeddings:
+        matrix, user_ids = self._cache[db_name]
+
+        if matrix is None or len(user_ids) == 0:
             return None
 
-        best_user_id = None
-        best_score = 0.0
+        # батч сравнение — одна матричная операция вместо цикла
+        # matrix @ camera_embedding = вектор scores (N,)
+        scores = matrix @ camera_embedding
 
-        for emb_record in all_embeddings:
-            # конвертируем байты → numpy array
-            stored_embedding = self.bytes_to_embedding(emb_record.embedding)
-
-            # считаем сходство
-            score = self.cosine_similarity(camera_embedding, stored_embedding)
-
-            if score > best_score:
-                best_score = score
-                best_user_id = emb_record.user_id
+        best_idx = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
 
         # проверяем порог
         if best_score >= SIMILARITY_THRESHOLD:
             return {
-                "user_id": best_user_id,
+                "user_id": user_ids[best_idx],
                 "score": best_score,
             }
 

@@ -85,6 +85,9 @@ def upload_face(
         tenant_db.commit()
         tenant_db.refresh(face_embedding)
 
+        # сбрасываем кэш — добавили новое фото
+        face_service.invalidate_cache(current_user["db_name"])
+
         count = face_service.get_embeddings_count(user_id, tenant_db)
 
         return {
@@ -109,9 +112,7 @@ def get_user_faces(
     tenant_db: Session = next(get_tenant_db(current_user["db_name"]))
 
     try:
-        user = tenant_db.query(User).filter(
-            User.id == user_id,
-        ).first()
+        user = tenant_db.query(User).filter(User.id == user_id).first()
 
         if not user:
             raise HTTPException(status_code=404, detail="Пользователь не найден")
@@ -160,6 +161,9 @@ def delete_face(
 
         tenant_db.delete(embedding)
         tenant_db.commit()
+
+        # сбрасываем кэш — удалили фото
+        face_service.invalidate_cache(current_user["db_name"])
 
         count = face_service.get_embeddings_count(user_id, tenant_db)
 
