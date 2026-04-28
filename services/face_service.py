@@ -179,6 +179,33 @@ class FaceService:
         return db.query(FaceEmbedding).filter(
             FaceEmbedding.user_id == user_id
         ).count()
+        
+        
+    def get_all_embeddings(self, image: np.ndarray) -> list:
+        """Возвращает эмбеддинги всех лиц на фото."""
+        if not self._initialized:
+            raise RuntimeError("FaceService не инициализирован")
+
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        faces = self._app.get(image)
+
+        if not faces:
+            return []
+
+        faces.sort(
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+            reverse=True,
+        )
+
+        return [face.normed_embedding for face in faces]
+
+
+    def is_sharp(self, image: np.ndarray) -> bool:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+        print(f"🔍 Резкость: {variance:.1f}")
+        return variance > 100
 
 
 face_service = FaceService()
