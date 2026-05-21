@@ -1,20 +1,27 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from core.logger import get_logger
+from core.rate_limit import limiter
 from core.master_db import master_engine, MasterBase
 from api.routes import admin, auth, users, departments, groups, devices, attendance, faces
 from api.websocket import router as ws_router
 from services.face_service import face_service
 import models.master
 
+logger = get_logger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     MasterBase.metadata.create_all(bind=master_engine)
-    print("✅ Таблицы master_db созданы")
+    logger.info("Таблицы master_db созданы")
     face_service.initialize()
     yield
-    print("🛑 Сервер остановлен")
+    logger.info("Сервер остановлен")
 
 
 app = FastAPI(
@@ -23,6 +30,9 @@ app = FastAPI(
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,

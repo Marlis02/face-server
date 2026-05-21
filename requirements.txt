@@ -1,15 +1,35 @@
-fastapi
-uvicorn
-sqlalchemy
-psycopg2-binary
-python-dotenv
-passlib[bcrypt]
-bcrypt==4.0.1
-python-jose[cryptography]
+# Прямые зависимости проекта.
+# Версии зафиксированы (`==`) чтобы комиссия и однокурсники
+# могли воспроизвести окружение через полгода/год.
+# Полный замороженный список (включая транзитивные пакеты)
+# лежит в requirements.lock.txt.
+
+# Web framework
+fastapi==0.136.1
+uvicorn==0.46.0
+starlette==1.0.0
+python-multipart==0.0.27
+websockets==16.0
+
+# Validation
+pydantic==2.13.3
 pydantic[email]
-insightface
-onnxruntime
-opencv-python-headless
-numpy
-python-multipart
-websockets
+
+# Database
+sqlalchemy==2.0.49
+psycopg2-binary==2.9.12
+
+# Config
+python-dotenv==1.2.2
+
+# Auth & security
+passlib==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.5.0
+slowapi==0.1.9
+
+# Face recognition
+insightface==0.7.3
+onnxruntime==1.23.2
+opencv-python-headless==4.13.0.92
+numpy==2.2.6

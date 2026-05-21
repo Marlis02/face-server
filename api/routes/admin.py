@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
+from core.logger import get_logger
 from core.master_db import get_master_db
 from core.tenant_db import create_tenant_database, create_tenant_tables
 from core.security import hash_password
@@ -10,6 +11,7 @@ import os
 import secrets
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "supersecret")
 
@@ -63,7 +65,7 @@ def create_tenant(
         create_tenant_database(db_name)
     except Exception as e:
         # если база уже существует — не страшно
-        print(f"База {db_name}: {e}")
+        logger.warning("create_tenant_database %s: %s", db_name, e)
 
     # создаём таблицы в новой базе
     create_tenant_tables(db_name)

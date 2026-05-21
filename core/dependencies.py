@@ -1,11 +1,13 @@
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from core.logger import get_logger
 from core.master_db import get_master_db
 from core.security import decode_token
 from models.master import Tenant
 
 security = HTTPBearer(auto_error=False)
+logger = get_logger(__name__)
 
 
 def get_current_user_payload(
@@ -44,6 +46,7 @@ def get_tenant_by_slug(
     ).first()
 
     if not tenant:
+        logger.warning("tenant lookup failed slug=%s", tenant_slug)
         raise HTTPException(
             status_code=404,
             detail=f"Организация '{tenant_slug}' не найдена"

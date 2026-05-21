@@ -1,18 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from sqlalchemy.orm import Session
 from core.tenant_db import get_tenant_db
 from core.master_db import get_master_db
 from core.security import verify_password, create_access_token, create_refresh_token, decode_token
 from core.dependencies import get_tenant_by_slug, get_current_user
+from core.rate_limit import limiter
+from core.logger import get_logger
 from models.master import Tenant
 from models.tenant import User
 from schemas.auth import LoginRequest, TokenResponse, RefreshRequest
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 @router.post("/{tenant_slug}/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
 def login(
+    request: Request,
     tenant_slug: str,
     data: LoginRequest,
     tenant: Tenant = Depends(get_tenant_by_slug),
@@ -34,6 +39,10 @@ def login(
         ).first()
 
         if not user:
+            logger.warning(
+                "login failed tenant=%s email=%s reason=no_user ip=%s",
+                tenant_slug, data.email, request.client.host if request.client else "?",
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Неверный email или пароль"
@@ -41,10 +50,19 @@ def login(
 
         # проверяем пароль
         if not verify_password(data.password, user.password_hash):
+            logger.warning(
+                "login failed tenant=%s user_id=%s reason=bad_password ip=%s",
+                tenant_slug, user.id, request.client.host if request.client else "?",
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Неверный email или пароль"
             )
+
+        logger.info(
+            "login ok tenant=%s user_id=%s role=%s",
+            tenant_slug, user.id, user.role,
+        )
 
         # данные для токена
         token_data = {

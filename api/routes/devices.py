@@ -1,13 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from sqlalchemy.orm import Session
 from core.tenant_db import get_tenant_db
 from core.master_db import get_master_db
 from core.dependencies import require_role
 from core.security import hash_password, verify_password
+from core.logger import get_logger
+from core.rate_limit import limiter
 from models.tenant import Device, Attendance
 from models.master import Tenant
 from schemas.device import (
-    DeviceCreate, DeviceUpdate, DeviceResponse,
+    DeviceCreate, DeviceCreateResponse, DeviceUpdate, DeviceResponse,
     DeviceLoginRequest, DeviceLoginResponse,
     DeviceInitResponse,
 )
@@ -15,6 +17,7 @@ from datetime import datetime, timezone
 import secrets
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 def get_device_by_token(
@@ -50,13 +53,17 @@ def get_device_by_token(
 
 # ─── CRUD устройств (для admin) ───────────────────────────────
 
-@router.post("/{tenant_slug}/devices", response_model=DeviceResponse)
+@router.post("/{tenant_slug}/devices", response_model=DeviceCreateResponse)
 def create_device(
     tenant_slug: str,
     data: DeviceCreate,
     current_user: dict = Depends(require_role("admin")),
 ):
-    """Создать устройство. Только admin."""
+    """
+    Создать устройство. Только admin.
+    Если password не указан — сервер сгенерирует 6-значный PIN и вернёт его
+    в поле initial_password (показывается один раз).
+    """
 
     tenant_db: Session = next(get_tenant_db(current_user["db_name"]))
 
@@ -71,17 +78,27 @@ def create_device(
                 detail="Устройство с таким логином уже существует"
             )
 
+        plain_password = data.password or _generate_device_pin()
+
         device = Device(
             name=data.name,
             login=data.login,
-            password_hash=hash_password(data.password),
+            password_hash=hash_password(plain_password),
             location=data.location,
         )
         tenant_db.add(device)
         tenant_db.commit()
         tenant_db.refresh(device)
 
-        return device
+        return DeviceCreateResponse(
+            id=device.id,
+            name=device.name,
+            login=device.login,
+            location=device.location,
+            is_active=device.is_active,
+            created_at=device.created_at,
+            initial_password=plain_password,
+        )
     finally:
         tenant_db.close()
 
@@ -177,7 +194,9 @@ def delete_device(
 # ─── Авторизация устройства (для планшета) ────────────────────
 
 @router.post("/{tenant_slug}/devices/login", response_model=DeviceLoginResponse)
+@limiter.limit("10/minute")
 def device_login(
+    request: Request,
     tenant_slug: str,
     data: DeviceLoginRequest,
     master_db: Session = Depends(get_master_db),
@@ -187,6 +206,11 @@ def device_login(
     Планшет отправляет login + password.
     Получает device_token для дальнейших запросов.
     """
+    client_ip = request.client.host if request.client else "?"
+    logger.info(
+        "device_login attempt tenant=%s login=%s ip=%s",
+        tenant_slug, data.login, client_ip,
+    )
 
     tenant = master_db.query(Tenant).filter(
         Tenant.slug == tenant_slug,
@@ -194,6 +218,10 @@ def device_login(
     ).first()
 
     if not tenant:
+        logger.warning(
+            "device_login failed tenant=%s ip=%s reason=tenant_not_found",
+            tenant_slug, client_ip,
+        )
         raise HTTPException(status_code=404, detail="Организация не найдена")
 
     tenant_db: Session = next(get_tenant_db(tenant.db_name))
@@ -205,6 +233,10 @@ def device_login(
         ).first()
 
         if not device or not verify_password(data.password, device.password_hash):
+            logger.warning(
+                "device_login failed tenant=%s login=%s ip=%s reason=bad_credentials",
+                tenant_slug, data.login, client_ip,
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Неверный логин или пароль"
@@ -214,6 +246,11 @@ def device_login(
         device.token = secrets.token_urlsafe(32)
         device.last_seen_at = datetime.now(timezone.utc)
         tenant_db.commit()
+
+        logger.info(
+            "device_login ok tenant=%s device_id=%s name=%s ip=%s",
+            tenant_slug, device.id, device.name, client_ip,
+        )
 
         return DeviceLoginResponse(
             device_token=device.token,
@@ -226,6 +263,7 @@ def device_login(
 
 @router.get("/{tenant_slug}/devices/init", response_model=DeviceInitResponse)
 def device_init(
+    request: Request,
     tenant_slug: str,
     master_db: Session = Depends(get_master_db),
     x_device_token: str = Header(...),
@@ -235,6 +273,7 @@ def device_init(
     Планшет отправляет device_token.
     Получает информацию об организации и устройстве.
     """
+    client_ip = request.client.host if request.client else "?"
 
     tenant = master_db.query(Tenant).filter(
         Tenant.slug == tenant_slug,
@@ -242,6 +281,10 @@ def device_init(
     ).first()
 
     if not tenant:
+        logger.warning(
+            "device_init failed tenant=%s ip=%s reason=tenant_not_found",
+            tenant_slug, client_ip,
+        )
         raise HTTPException(status_code=404, detail="Организация не найдена")
 
     tenant_db: Session = next(get_tenant_db(tenant.db_name))
@@ -253,6 +296,10 @@ def device_init(
         ).first()
 
         if not device:
+            logger.warning(
+                "device_init failed tenant=%s ip=%s reason=bad_token",
+                tenant_slug, client_ip,
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Невалидный токен устройства"
@@ -272,13 +319,20 @@ def device_init(
     finally:
         tenant_db.close()
         
+def _generate_device_pin() -> str:
+    """6-значный PIN для устройства (000000–999999).
+    Цифры удобно набирать на планшете и диктовать вслух.
+    Защита от подбора — rate limit на /devices/login + admin reset."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
 @router.post("/{tenant_slug}/devices/{device_id}/reset-password")
 def reset_device_password(
     tenant_slug: str,
     device_id: int,
     current_user: dict = Depends(require_role("admin")),
 ):
-    """Сбросить пароль устройства. Только admin."""
+    """Сбросить пароль устройства на новый 6-значный PIN. Только admin."""
 
     tenant_db: Session = next(get_tenant_db(current_user["db_name"]))
 
@@ -290,14 +344,16 @@ def reset_device_password(
         if not device:
             raise HTTPException(status_code=404, detail="Устройство не найдено")
 
-        # генерируем новый пароль
-        import secrets
-        new_password = secrets.token_urlsafe(8)
-
+        new_password = _generate_device_pin()
         device.password_hash = hash_password(new_password)
         # сбрасываем токен — устройство должно перелогиниться
         device.token = None
         tenant_db.commit()
+
+        logger.info(
+            "device password reset tenant=%s device_id=%s by_user=%s",
+            tenant_slug, device.id, current_user.get("user_id"),
+        )
 
         return {
             "message": f"Пароль устройства '{device.name}' сброшен",

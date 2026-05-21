@@ -6,8 +6,25 @@ from typing import Optional
 class DeviceCreate(BaseModel):
     name: str
     login: str
-    password: str
+    # необязательно — если не указан, сервер сгенерирует 6-значный PIN
+    password: Optional[str] = None
     location: Optional[str] = None
+
+
+class DeviceCreateResponse(BaseModel):
+    """Расширенный ответ при создании устройства — содержит сгенерированный PIN.
+    PIN возвращается ОДИН РАЗ при создании; в базе хранится только bcrypt-хеш."""
+    id: int
+    name: str
+    login: str
+    location: Optional[str]
+    is_active: bool
+    created_at: datetime
+    # plain-text PIN — показать админу один раз
+    initial_password: str
+
+    class Config:
+        from_attributes = True
 
 
 class DeviceUpdate(BaseModel):

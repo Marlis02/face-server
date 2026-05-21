@@ -4,7 +4,15 @@ from insightface.app import FaceAnalysis
 from sqlalchemy.orm import Session
 from models.tenant import FaceEmbedding
 from concurrent.futures import ThreadPoolExecutor
-import pickle
+
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
+# размерность эмбеддинга InsightFace buffalo_l (ArcFace)
+EMBEDDING_DIM = 512
+EMBEDDING_DTYPE = np.float32
+EMBEDDING_BYTES = EMBEDDING_DIM * np.dtype(EMBEDDING_DTYPE).itemsize  # 2048
 
 # порог сходства — если выше то совпадение
 SIMILARITY_THRESHOLD = 0.5
@@ -34,7 +42,7 @@ class FaceService:
         if self._initialized:
             return
 
-        print("⏳ Загрузка модели InsightFace...")
+        logger.info("Загрузка модели InsightFace...")
 
         self._app = FaceAnalysis(
             name="buffalo_l",       # модель ArcFace
@@ -43,7 +51,7 @@ class FaceService:
         self._app.prepare(ctx_id=0, det_size=(640, 640))
 
         self._initialized = True
-        print("✅ InsightFace загружен")
+        logger.info("InsightFace загружен")
 
     def get_embedding(self, image: np.ndarray) -> np.ndarray | None:
         """
@@ -66,12 +74,31 @@ class FaceService:
         return face.normed_embedding  # уже нормализованный вектор (512,)
 
     def embedding_to_bytes(self, embedding: np.ndarray) -> bytes:
-        """Конвертирует эмбеддинг в байты для хранения в базе."""
-        return pickle.dumps(embedding)
+        """
+        Конвертирует эмбеддинг в байты для хранения в базе.
+        Используется raw float32 (2048 байт) без pickle —
+        pickle.loads на ненадёжных данных = RCE.
+        """
+        return np.ascontiguousarray(embedding, dtype=EMBEDDING_DTYPE).tobytes()
 
     def bytes_to_embedding(self, data: bytes) -> np.ndarray:
-        """Конвертирует байты из базы обратно в эмбеддинг."""
-        return pickle.loads(data)
+        """
+        Конвертирует байты из базы обратно в эмбеддинг.
+        Поддерживает legacy pickle-формат для совместимости со старыми записями
+        (см. scripts/migrate_embeddings.py для одноразовой миграции).
+        """
+        if len(data) == EMBEDDING_BYTES:
+            return np.frombuffer(data, dtype=EMBEDDING_DTYPE)
+
+        # legacy: ранее эмбеддинги хранились через pickle.dumps(np.ndarray).
+        # Запустите scripts/migrate_embeddings.py чтобы пересохранить в raw float32.
+        import pickle  # noqa: S403 — только для разовой миграции
+        logger.warning(
+            "Legacy pickle-эмбеддинг (%d байт). Запустите миграцию.",
+            len(data),
+        )
+        arr = pickle.loads(data)  # noqa: S301
+        return np.asarray(arr, dtype=EMBEDDING_DTYPE)
 
     def cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """
@@ -107,7 +134,10 @@ class FaceService:
         matrix = np.array(vectors, dtype=np.float32)
         self._cache[db_name] = (matrix, user_ids)
 
-        print(f"✅ Кэш загружен: {len(user_ids)} эмбеддингов для {db_name}")
+        logger.info(
+            "Кэш загружен: %d эмбеддингов для %s",
+            len(user_ids), db_name,
+        )
 
     def invalidate_cache(self, db_name: str):
         """
@@ -116,7 +146,7 @@ class FaceService:
         """
         if db_name in self._cache:
             del self._cache[db_name]
-            print(f"🔄 Кэш сброшен для {db_name}")
+            logger.info("Кэш сброшен для %s", db_name)
 
     def find_match(
         self,
@@ -204,7 +234,7 @@ class FaceService:
         image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-        print(f"🔍 Резкость: {variance:.1f}")
+        logger.debug("sharpness variance=%.1f", variance)
         return variance > 100
 
 

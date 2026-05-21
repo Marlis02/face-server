@@ -1,12 +1,12 @@
 import asyncio
 import json
 import struct
-import cv2
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
+from core.logger import get_logger
 from core.master_db import get_master_db
 from core.tenant_db import get_tenant_db
 from models.master import Tenant
@@ -14,6 +14,7 @@ from models.tenant import Device, User, Attendance
 from services.face_service import face_service, executor
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 async def authorize_device(
@@ -25,12 +26,18 @@ async def authorize_device(
     Возвращает (tenant, device_id, device_name) или None если ошибка.
     """
 
+    client_ip = websocket.client.host if websocket.client else "?"
+
     try:
         raw = await asyncio.wait_for(
             websocket.receive_text(),
             timeout=10.0,
         )
     except asyncio.TimeoutError:
+        logger.warning(
+            "ws auth failed tenant=%s ip=%s reason=timeout",
+            tenant_slug, client_ip,
+        )
         await websocket.send_text(json.dumps({
             "type": "error",
             "message": "Таймаут авторизации",
@@ -42,6 +49,10 @@ async def authorize_device(
         auth_data = json.loads(raw)
         token = auth_data.get("token")
     except json.JSONDecodeError:
+        logger.warning(
+            "ws auth failed tenant=%s ip=%s reason=bad_json",
+            tenant_slug, client_ip,
+        )
         await websocket.send_text(json.dumps({
             "type": "error",
             "message": "Неверный формат — ожидается JSON с полем token",
@@ -50,6 +61,10 @@ async def authorize_device(
         return None
 
     if not token:
+        logger.warning(
+            "ws auth failed tenant=%s ip=%s reason=no_token",
+            tenant_slug, client_ip,
+        )
         await websocket.send_text(json.dumps({
             "type": "error",
             "message": "Токен не указан",
@@ -68,6 +83,10 @@ async def authorize_device(
         master_db.close()
 
     if not tenant:
+        logger.warning(
+            "ws auth failed tenant=%s ip=%s reason=tenant_not_found",
+            tenant_slug, client_ip,
+        )
         await websocket.send_text(json.dumps({
             "type": "error",
             "message": f"Организация '{tenant_slug}' не найдена",
@@ -84,6 +103,10 @@ async def authorize_device(
         ).first()
 
         if not device:
+            logger.warning(
+                "ws auth failed tenant=%s ip=%s reason=bad_token",
+                tenant_slug, client_ip,
+            )
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "message": "Невалидный токен устройства",
@@ -117,7 +140,7 @@ async def process_frame(
     tracking_id = struct.unpack(">i", data[:4])[0]
     jpeg_bytes = data[4:]
 
-    print(f"📸 [{tracking_id}] Получен кадр: {len(jpeg_bytes)} байт")
+    logger.debug("frame received tracking_id=%d bytes=%d", tracking_id, len(jpeg_bytes))
 
     loop = asyncio.get_event_loop()
 
@@ -128,7 +151,7 @@ async def process_frame(
         jpeg_bytes,
     )
     if image is None:
-        print(f"❌ [{tracking_id}] Не удалось декодировать изображение")
+        logger.warning("decode failed tracking_id=%d", tracking_id)
         await websocket.send_text(json.dumps({
             "type": "result",
             "tracking_id": tracking_id,
@@ -137,16 +160,9 @@ async def process_frame(
         }))
         return
 
-    print(f"🖼 [{tracking_id}] Декодировано: {image.shape}")
-    
-    if tracking_id <= 100:
-        import os
-        home = os.path.expanduser("~")
-        save_path = os.path.join(home, f"debug_frame_{tracking_id}.jpg")
-        cv2.imwrite(save_path, image)
-        print(f"💾 [{tracking_id}] Сохранён: {save_path}")
-
     # получаем все эмбеддинги всех лиц на фото
+    # ВНИМАНИЕ: исходные кадры лиц НЕ сохраняются на диск (§3.1 ВКР).
+    # На сервере остаётся только биометрический эмбеддинг.
     embeddings = await loop.run_in_executor(
         executor,
         face_service.get_all_embeddings,
@@ -154,7 +170,7 @@ async def process_frame(
     )
 
     if not embeddings:
-        print(f"😶 [{tracking_id}] Лица не найдены")
+        logger.info("no face tracking_id=%d", tracking_id)
         await websocket.send_text(json.dumps({
             "type": "result",
             "tracking_id": tracking_id,
@@ -163,7 +179,7 @@ async def process_frame(
         }))
         return
 
-    print(f"🧠 [{tracking_id}] Найдено лиц на фото: {len(embeddings)}")
+    logger.debug("faces detected tracking_id=%d count=%d", tracking_id, len(embeddings))
 
     tenant_db: Session = next(get_tenant_db(tenant.db_name))
     try:
@@ -172,7 +188,7 @@ async def process_frame(
         match = face_service.find_match(embedding, tenant.db_name, tenant_db)
 
         if not match:
-            print(f"🔍 [{tracking_id}] Совпадение не найдено")
+            logger.info("no match tracking_id=%d", tracking_id)
             await websocket.send_text(json.dumps({
                 "type": "result",
                 "tracking_id": tracking_id,
@@ -183,7 +199,10 @@ async def process_frame(
 
         user_id = match["user_id"]
         confidence = match["score"]
-        print(f"✨ [{tracking_id}] Найден user_id={user_id} confidence={confidence:.3f}")
+        logger.info(
+            "match tracking_id=%d user_id=%s score=%.3f",
+            tracking_id, user_id, confidence,
+        )
 
         # находим пользователя
         user = tenant_db.query(User).filter(
@@ -192,7 +211,10 @@ async def process_frame(
         ).first()
 
         if not user:
-            print(f"⚠️ [{tracking_id}] Пользователь user_id={user_id} не найден")
+            logger.warning(
+                "matched user not found tracking_id=%d user_id=%s",
+                tracking_id, user_id,
+            )
             await websocket.send_text(json.dumps({
                 "type": "result",
                 "tracking_id": tracking_id,
@@ -210,7 +232,10 @@ async def process_frame(
         ).first()
 
         if existing:
-            print(f"🔁 [{tracking_id}] {user.full_name} уже отмечен сегодня")
+            logger.info(
+                "already marked tracking_id=%d user_id=%s",
+                tracking_id, user_id,
+            )
             await websocket.send_text(json.dumps({
                 "type": "result",
                 "tracking_id": tracking_id,
@@ -231,7 +256,10 @@ async def process_frame(
         tenant_db.add(attendance)
         tenant_db.commit()
 
-        print(f"✅ [{tracking_id}] Отмечен: {user.full_name} ({confidence:.3f})")
+        logger.info(
+            "attendance marked user_id=%s device_id=%s score=%.3f",
+            user_id, device_id, confidence,
+        )
 
         await websocket.send_text(json.dumps({
             "type": "result",
@@ -280,7 +308,10 @@ async def websocket_endpoint(
             "device_name": device_name,
         }))
 
-        print(f"✅ Планшет подключён: {device_name} ({tenant.name})")
+        logger.info(
+            "device connected device_id=%s name=%s tenant=%s",
+            device_id, device_name, tenant.slug,
+        )
 
         # основной цикл
         while True:
@@ -296,9 +327,9 @@ async def websocket_endpoint(
             await process_frame(websocket, data, tenant, device_id)
 
     except WebSocketDisconnect:
-        print(f"❌ Планшет отключился: {device_name}")
+        logger.info("device disconnected device=%s", device_name)
     except Exception as e:
-        print(f"❌ Ошибка WebSocket [{device_name}]: {e}")
+        logger.exception("websocket error device=%s: %s", device_name, e)
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
