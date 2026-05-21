@@ -344,3 +344,30 @@ def test_t12_manager_cannot_delete_user(
         headers=manager_headers,
     )
     assert r.status_code == 403, r.text
+
+
+# ─── T-13. Экспорт журнала в Excel ────────────────────────────────────
+
+def test_t13_export_attendance_xlsx(
+    client, db, tenant_slug, admin_headers, user1_id,
+):
+    """xlsx с заголовком и хотя бы одной строкой данных."""
+    from datetime import date as _date
+    db.add(Attendance(
+        user_id=user1_id, date=_date.today(),
+        status="manual", note="T-13",
+    ))
+    db.commit()
+
+    r = client.get(
+        f"/api/{tenant_slug}/attendance/export",
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument"
+    )
+    assert "attachment" in r.headers.get("content-disposition", "")
+    # xlsx — это zip-архив, начинается с PK\x03\x04
+    assert r.content[:2] == b"PK"
+    assert len(r.content) > 500

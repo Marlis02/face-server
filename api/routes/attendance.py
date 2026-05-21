@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from core.tenant_db import get_tenant_db
@@ -12,8 +13,11 @@ from schemas.attendance import (
     DailyAttendance,
     UserDailyDetail,
 )
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
+import io
+import xlsxwriter
+
 from models.tenant import Device
 
 router = APIRouter()
@@ -114,6 +118,136 @@ def get_attendance(
             query = query.filter(Attendance.date <= date_to)
 
         return query.order_by(Attendance.marked_at.desc()).all()
+    finally:
+        tenant_db.close()
+
+
+@router.get("/{tenant_slug}/attendance/export")
+def export_attendance_xlsx(
+    tenant_slug: str,
+    user_id: Optional[int] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    group_id: Optional[int] = None,
+    department_id: Optional[int] = None,
+    current_user: dict = Depends(require_role("admin", "manager")),
+):
+    """
+    Экспорт журнала посещений в Excel (.xlsx).
+    Те же фильтры что у /attendance + group_id/department_id.
+    Возвращает поток с готовым файлом, имя файла зашито в Content-Disposition.
+    """
+    tenant_db: Session = next(get_tenant_db(current_user["db_name"]))
+
+    try:
+        q = (
+            tenant_db.query(Attendance, User, Group, Department, Device)
+            .join(User, Attendance.user_id == User.id)
+            .outerjoin(Group, User.group_id == Group.id)
+            .outerjoin(Department, User.department_id == Department.id)
+            .outerjoin(Device, Attendance.device_id == Device.id)
+        )
+
+        if user_id:
+            q = q.filter(Attendance.user_id == user_id)
+        if date_from:
+            q = q.filter(Attendance.date >= date_from)
+        if date_to:
+            q = q.filter(Attendance.date <= date_to)
+        if group_id:
+            q = q.filter(User.group_id == group_id)
+        if department_id:
+            q = q.filter(User.department_id == department_id)
+
+        rows = q.order_by(
+            Attendance.date.desc(),
+            Attendance.marked_at.desc(),
+        ).all()
+
+        buf = io.BytesIO()
+        wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+        ws = wb.add_worksheet("Посещения")
+
+        # форматы
+        f_header = wb.add_format({
+            "bold": True, "bg_color": "#305496", "font_color": "white",
+            "align": "center", "valign": "vcenter", "border": 1,
+        })
+        f_date = wb.add_format({"num_format": "yyyy-mm-dd", "border": 1})
+        f_dt = wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss", "border": 1})
+        f_cell = wb.add_format({"border": 1})
+        f_status_auto = wb.add_format({
+            "border": 1, "bg_color": "#E2EFDA", "align": "center",
+        })
+        f_status_manual = wb.add_format({
+            "border": 1, "bg_color": "#FFF2CC", "align": "center",
+        })
+
+        headers = [
+            ("ID", 6),
+            ("ФИО", 28),
+            ("Email", 26),
+            ("Отдел", 22),
+            ("Группа", 14),
+            ("Дата", 12),
+            ("Отмечено в", 20),
+            ("Статус", 10),
+            ("Устройство", 22),
+            ("Примечание", 30),
+        ]
+        for col, (title, width) in enumerate(headers):
+            ws.set_column(col, col, width)
+            ws.write(0, col, title, f_header)
+
+        ws.set_row(0, 22)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, max(len(rows), 1), len(headers) - 1)
+
+        for r, (att, usr, grp, dept, dev) in enumerate(rows, start=1):
+            ws.write_number(r, 0, att.id, f_cell)
+            ws.write_string(r, 1, usr.full_name, f_cell)
+            ws.write_string(r, 2, usr.email or "", f_cell)
+            ws.write_string(r, 3, dept.name if dept else "", f_cell)
+            ws.write_string(r, 4, grp.name if grp else "", f_cell)
+            ws.write_datetime(r, 5, datetime.combine(att.date, datetime.min.time()), f_date)
+            if att.marked_at:
+                ws.write_datetime(r, 6, att.marked_at.replace(tzinfo=None), f_dt)
+            else:
+                ws.write_string(r, 6, "", f_cell)
+            ws.write_string(
+                r, 7,
+                "авто" if att.status == "auto" else "вручную",
+                f_status_auto if att.status == "auto" else f_status_manual,
+            )
+            ws.write_string(r, 8, dev.name if dev else "", f_cell)
+            ws.write_string(r, 9, att.note or "", f_cell)
+
+        # сводка под таблицей
+        summary_row = len(rows) + 2
+        f_summary = wb.add_format({"italic": True, "font_color": "#595959"})
+        ws.write(summary_row, 0, f"Всего записей: {len(rows)}", f_summary)
+        if date_from or date_to:
+            ws.write(
+                summary_row + 1, 0,
+                f"Период: {date_from or '...'} — {date_to or '...'}",
+                f_summary,
+            )
+
+        wb.close()
+        buf.seek(0)
+
+        # имя файла с меткой времени, чтобы не перетирался в браузере
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"attendance_{tenant_slug}_{stamp}.xlsx"
+
+        return StreamingResponse(
+            buf,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
     finally:
         tenant_db.close()
 
