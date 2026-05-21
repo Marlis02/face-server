@@ -13,12 +13,20 @@ import secrets
 router = APIRouter()
 logger = get_logger(__name__)
 
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "supersecret")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
+if not ADMIN_SECRET:
+    raise RuntimeError(
+        "ADMIN_SECRET не задан. Сгенерируйте секрет "
+        "(python -c \"import secrets; print(secrets.token_urlsafe(32))\") "
+        "и добавьте в .env."
+    )
 
 
 def verify_admin_secret(x_admin_secret: str = Header(...)):
-    """Простая защита через секретный ключ в заголовке."""
-    if x_admin_secret != ADMIN_SECRET:
+    """Защита /admin/* через секретный ключ в заголовке X-Admin-Secret.
+    Сравнение — постоянное время, чтобы исключить timing-атаку."""
+    if not secrets.compare_digest(x_admin_secret, ADMIN_SECRET):
+        logger.warning("admin access denied")
         raise HTTPException(status_code=403, detail="Нет доступа")
 
 
